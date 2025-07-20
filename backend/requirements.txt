@@ -1,0 +1,16 @@
+# Backend dependencies for the project
+# This file is used to manage Python package dependencies.
+# Use pip to install the packages listed below.
+fastapi
+uvicorn[standard]
+spotipy
+weaviate-client
+sentence-transformers
+transformers
+torch
+numpy
+pandas
+python-dotenv
+pydantic
+langdetect
+requests
