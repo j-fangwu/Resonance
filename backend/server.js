@@ -6,6 +6,8 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 8000;
 
+const weaviateClient = require('./weaviateClient');
+
 app.use(cors({
     origin: 'http://127.0.0.1:3000',
     credentials: true
@@ -33,7 +35,6 @@ if (missingVars.length > 0) {
 }
 
 // Spotify token exchange endpoint with extensive debugging
-
 const rateLimit = require('express-rate-limit');
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
@@ -168,10 +169,273 @@ app.post('/api/spotify/auth', authLimiter, async (req, res) => {
     }
 });
 
-app.post('/api/spotify/refresh', async (req, res) => {
-    const { refresh_token } = req.body;
-    // Implementation for token refresh
+const refreshLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 20, // Allow more refresh attempts than auth (tokens expire every hour)
+    message: 'Too many refresh requests, please try again later.',
+    standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+    legacyHeaders: false, // Disable the `X-RateLimit-*` headers
 });
+
+app.post('/api/spotify/refresh', refreshLimiter, async (req, res) => {
+    console.log('🎵 === SPOTIFY TOKEN REFRESH START ===');
+
+    try {
+        const { refresh_token } = req.body;
+
+        if (!refresh_token) {
+            console.log('❌ No refresh token provided');
+            return res.status(400).json({ error: 'Refresh token is required' });
+        }
+
+        console.log('✅ Received refresh token:', refresh_token.substring(0, 20) + '...');
+
+        // Validate environment variables
+        const clientId = process.env.SPOTIFY_CLIENT_ID;
+        const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+
+        if (!clientId || !clientSecret) {
+            console.log('❌ Missing required environment variables');
+            return res.status(500).json({ error: 'Internal server error' }); 
+        }
+
+        // Prepare token refresh
+        const params = new URLSearchParams();
+        params.append('grant_type', 'refresh_token');
+        params.append('refresh_token', refresh_token);
+        params.append('client_id', clientId);
+        params.append('client_secret', clientSecret);
+
+        console.log('📤 Making request to Spotify token endpoint for refresh...');
+
+        const response = await axios.post('https://accounts.spotify.com/api/token', params, {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded'
+            },
+            timeout: 10000,
+        });
+
+        console.log('✅ Token refresh successful');
+        console.log('New token:', response.data.access_token?.substring(0, 20) + '...');
+
+        const responseData = {
+            access_token: response.data.access_token,
+            accessToken: response.data.access_token,
+            refresh_token: response.data.refresh_token || refresh_token, // Use new one if provided, else keep old
+            refreshToken: response.data.refresh_token || refresh_token, 
+            expires_in: response.data.expires_in,
+            token_type: response.data.token_type,
+            scope: response.data.scope
+        };
+        res.json(responseData);
+
+    } catch (error) {
+        console.error('Error refreshing token:', error);
+        res.status(500).json({ error: 'Failed to refresh token' });
+
+        if (error.response) {
+            console.error('Response data:', error.response.data);
+        } else {
+            console.error('Error message:', error.message);
+        }
+    } finally {
+        console.log('🎵 === SPOTIFY TOKEN REFRESH END ===\n');
+    }
+});
+
+// Weaviate schemas
+app.post('/api/weaviate/init', async (req, res) => {
+    try {
+        console.log('Initializing Weaviate client...');
+        await weaviateClient.initialize();
+        console.log('Weaviate client initialized successfully.');
+        res.status(200).json({ message: 'Weaviate client initialized successfully.' });
+    } catch (error) {
+        console.error('Error initializing Weaviate client:', error);
+        res.status(500).json({ error: 'Failed to initialize Weaviate client' });
+    }
+});
+
+// Process playlist and store in Weaviate
+app.post('/api/playlist/process', async (req, res) => {
+    try {
+        const { playlistId, tracks, playlistName } = req.body;
+        const token = req.headers.authorization?.replace('Bearer ', '');
+
+        if (!token) {
+            return res.status(401).json({ error: 'No token provided' });
+        }
+        if (!playlistId || !tracks || !playlistName) {
+            return res.status(400).json({ error: 'Incomplete playlist data provided' });
+        }
+
+        console.log('Processing playlist...');
+
+        const processedSongs = []
+
+        for (let i = 0; i < tracks.length; i++) {
+            const trackItem = tracks[i];
+            const track = trackItem.track;
+
+            if (!track || !track.id) continue;
+
+            try {
+                const audioFeaturesResponse = await axios.get(
+                    `https://api.spotify.com/v1/audio-features/${track.id}`,
+                    {
+                        headers: { Authorization: `Bearer ${token}` },
+                        timeout: 5000   
+                    }
+                );
+
+                const songData = {
+                    spotifyId: track.id,
+                    title: track.name,
+                    artist: track.artists.map(a => a.name).join(', '),
+                    album: track.album.name,
+                    genre: track.album.genres || [],
+                    audioFeatures: audioFeaturesResponse.data,
+                    releaseDate: track.album.release_date,
+                    popularity: track.popularity || 0,
+                    lyrics: ''
+                };
+
+                const weaviateId = await weaviateClient.addSong(songData);
+                processedSongs.push({ ...songData, weaviateId });
+
+                console.log(`Processed song: ${songData.title} by ${songData.artist} - (Weaviate ID: ${weaviateId})`);
+                
+                if (i < tracks.length - 1) {
+                    await new Promise(resolve => setTimeout(resolve, 100)); // 100ms delay
+                }
+            } catch (error) {
+                console.error('Error fetching audio features:', error);
+            }
+        }
+
+        const playlistData = {
+            spotifyId: playlistId,
+            name: playlistName,
+            description: `Processed playlist with ${processedSongs.length} songs`,
+            owner: 'user',
+            tags: ['processed'],
+            mood: 'mixed',
+            songCount: processedSongs.length
+        };
+
+        const playlistWeaviateId = await weaviateClient.addPlaylist(playlistData);
+
+        res.json({
+            success: true,
+            message: `Successfully processed ${processedSongs.length} songs`,
+            playlistId: playlistWeaviateId,
+            processedSongs: processedSongs.length,
+            totalTracks: tracks.length
+        });
+
+        console.log('Playlist processed and stored successfully.');
+    } catch (error) {
+        console.error('Error processing playlist:', error);
+        res.status(500).json({ error: 'Failed to process playlist' });
+    }
+});
+
+app.post('/api/songs/search', async (req, res) => {
+    try {
+        const { query, limit = 10 } = req.body;
+        console.log(`Searching for songs with query: ${query} and limit: ${limit}`);
+        const results = await weaviateClient.semanticSearchSongs(query, limit);
+
+        res.json({
+            success: true,
+            results,
+            query,
+            count: results.length
+        });
+    } catch (error) {
+        console.error('Error searching songs:', error);
+        res.status(500).json({ error: 'Failed to search songs' });
+    }
+});
+
+app.post('/api/songs/advanced-search', async (req, res) => {
+    try {
+        const { query, filters = {}, limit = 10 } = req.body;
+
+        console.log(`Advanced search for songs with query: ${query}, filters: ${JSON.stringify(filters)}, limit: ${limit}`);
+
+        const songs = await weaviateClient.advancedSearchSongs(query, filters, limit);
+
+        res.json({
+            success: true,
+            results: songs,
+            query,
+            filters,
+            count: songs.length
+        });
+    } catch (error) {
+        console.error('Error in advanced search:', error);
+        res.status(500).json({ error: 'Failed to perform advanced search' });
+    }
+});
+
+app.get('/api/songs/:id/similar', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { limit = 5 } = req.query;
+
+        const similarSongs = await weaviateClient.getSimilarSongs(id, parseInt(limit));
+        
+        res.json({
+            success: true,
+            similarSongs,
+            count: similarSongs.length
+        });
+    } catch (error) {
+        console.error('Error fetching similar songs:', error);
+        res.status(500).json({ error: 'Failed to fetch similar songs' });
+    }
+});
+
+app.post('/api/playlist/generate', async (req, res) => {
+    try {
+        const { theme, mood, limit = 20 } = req.body;
+
+        const searchQuery = `${theme} ${mood} music`;
+        const songs = await weaviateClient.semanticSearchSongs(searchQuery, limit);
+
+        const songTitles = songs.slice(0, 5).map(s => `${s.title} by ${s.artist}`);
+        const description = await weaviateClient.generatePlaylistDescription(songTitles);
+
+        res.json({
+            success: true,
+            description: {
+                name: `${theme} ${mood} Mix`,
+                description,
+                songs,
+                theme,
+                mood
+            }
+        });
+    } catch (error) {
+
+        console.error('Error generating playlist description:', error);
+        res.status(500).json({ error: 'Failed to generate playlist description' });
+    }
+});
+
+app.get('/api/weaviate/health', async (req, res) => {
+    try {
+        const isReady = await weaviateClient.isReady();
+        res.json({
+            weaviate: isReady ? 'ready' : 'not ready',
+            timestamp: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error('Error checking Weaviate health:', error);
+        res.status(500).json({ error: 'Weaviate not available' });
+    }
+})
 
 // Enhanced health check with environment info
 app.get('/api/health', (req, res) => {
@@ -245,5 +509,6 @@ app.listen(PORT, '127.0.0.1', () => {
     console.log('- GET  /api/debug/env    - Environment check');
     console.log('- POST /api/spotify/auth - Token exchange');
     console.log('- GET  /api/test/token   - Token validation');
+    console.log('- POST /api/spotify/refresh - Token refresh');
     console.log('\n🔍 Ready for debugging!\n');
 });

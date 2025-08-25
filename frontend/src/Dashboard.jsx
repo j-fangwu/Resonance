@@ -13,6 +13,14 @@ export default function Dashboard() {
     const [playlistTracks, setPlaylistTracks] = useState([]);
     const [loadingTracks, setLoadingTracks] = useState(false);
 
+    // NEW RAG STATE VARIABLES - ADD THESE
+    const [processing, setProcessing] = useState(false);
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchResults, setSearchResults] = useState([]);
+    const [searching, setSearching] = useState(false);
+    const [processedPlaylists, setProcessedPlaylists] = useState([]);
+    const [weaviateStatus, setWeaviateStatus] = useState('unknown');
+
     // Token refresh function
     const refreshAccessToken = useCallback(async () => {
         const refreshToken = localStorage.getItem('spotifyRefreshToken');
@@ -36,7 +44,6 @@ export default function Dashboard() {
             }
         } catch (error) {
             console.error('Token refresh failed:', error.response?.data || error.message);
-            // If refresh fails, clear tokens and redirect to login
             localStorage.removeItem('spotifyAccessToken');
             localStorage.removeItem('spotifyRefreshToken');
             return null;
@@ -58,19 +65,15 @@ export default function Dashboard() {
         };
 
         try {
-            // Try with current token
             return await makeRequest(token);
         } catch (error) {
-            // If 401, try to refresh token and retry
             if (error.response?.status === 401) {
                 console.log('Token expired, attempting refresh...');
                 const newToken = await refreshAccessToken();
                 
                 if (newToken) {
-                    // Retry with new token
                     return await makeRequest(newToken);
                 } else {
-                    // Refresh failed, redirect to login
                     throw new Error('Session expired. Please log in again.');
                 }
             }
@@ -78,13 +81,138 @@ export default function Dashboard() {
         }
     }, [refreshAccessToken]);
 
+    // NEW RAG FUNCTIONS - ADD THESE
+
+    // Initialize Weaviate on component mount
+    useEffect(() => {
+        const initializeWeaviate = async () => {
+            try {
+                console.log('🔧 Initializing Weaviate...');
+                setWeaviateStatus('initializing');
+                
+                // Check Weaviate health
+                const healthResponse = await axios.get('http://127.0.0.1:8000/api/weaviate/health');
+                console.log('Weaviate health:', healthResponse.data);
+                
+                // Initialize schema
+                const initResponse = await axios.post('http://127.0.0.1:8000/api/weaviate/init');
+                console.log('Weaviate schema initialized:', initResponse.data);
+                
+                setWeaviateStatus('ready');
+            } catch (error) {
+                console.error('Failed to initialize Weaviate:', error);
+                setWeaviateStatus('error');
+            }
+        };
+        
+        initializeWeaviate();
+    }, []);
+
+    // Process playlist with RAG
+    const processPlaylistWithRAG = async (playlist) => {
+        if (processing) return;
+        
+        setProcessing(true);
+        try {
+            console.log(`🎯 Processing playlist "${playlist.name}" with RAG...`);
+            
+            // First fetch all tracks if not already fetched
+            let tracks = playlistTracks;
+            if (selectedPlaylist?.id !== playlist.id) {
+                await fetchPlaylistTracks(playlist.id, playlist.name);
+                tracks = playlistTracks; // This will be updated by fetchPlaylistTracks
+            }
+            
+            // Send to RAG processing
+            const token = localStorage.getItem('spotifyAccessToken');
+            const response = await axios.post(
+                'http://127.0.0.1:8000/api/playlist/process',
+                {
+                    playlistId: playlist.id,
+                    tracks: tracks.length > 0 ? tracks : playlistTracks,
+                    playlistName: playlist.name
+                },
+                {
+                    headers: { Authorization: `Bearer ${token}` },
+                    timeout: 120000 // 2 minute timeout for large playlists
+                }
+            );
+            
+            console.log('✅ Playlist processed:', response.data);
+            setProcessedPlaylists(prev => [...prev, playlist.id]);
+            
+            alert(`🎉 Successfully processed "${playlist.name}"!\n` +
+                  `${response.data.processedSongs}/${response.data.totalTracks} songs indexed for AI search.`);
+                  
+        } catch (error) {
+            console.error('❌ Error processing playlist:', error);
+            
+            if (error.code === 'ECONNABORTED') {
+                alert('Processing timed out. Large playlists may take longer. Please try again.');
+            } else {
+                alert(`Failed to process "${playlist.name}". Please try again.\n\nError: ${error.response?.data?.error || error.message}`);
+            }
+        } finally {
+            setProcessing(false);
+        }
+    };
+
+    // Search songs using RAG
+    const searchSongs = async () => {
+        if (!searchQuery.trim() || searching) return;
+        
+        setSearching(true);
+        try {
+            console.log(`🔍 Searching for: "${searchQuery}"`);
+            
+            const response = await axios.post('http://127.0.0.1:8000/api/songs/search', {
+                query: searchQuery,
+                limit: 20
+            });
+            
+            setSearchResults(response.data.results);
+            console.log(`Found ${response.data.results.length} results`);
+            
+        } catch (error) {
+            console.error('Search failed:', error);
+            setError('Search failed. Make sure you have processed some playlists first.');
+            setTimeout(() => setError(null), 3000);
+        } finally {
+            setSearching(false);
+        }
+    };
+
+    // Generate smart playlist
+    const generateSmartPlaylist = async (theme, mood) => {
+        try {
+            setSearching(true);
+            console.log(`🎨 Generating ${theme} ${mood} playlist...`);
+            
+            const response = await axios.post('http://127.0.0.1:8000/api/playlist/generate', {
+                theme,
+                mood,
+                limit: 20
+            });
+            
+            setSearchResults(response.data.playlist.songs);
+            setSearchQuery(`${theme} ${mood} mix`);
+            console.log('Generated playlist:', response.data.playlist);
+            
+        } catch (error) {
+            console.error('Failed to generate playlist:', error);
+            setError('Failed to generate smart playlist. Process some playlists first.');
+            setTimeout(() => setError(null), 3000);
+        } finally {
+            setSearching(false);
+        }
+    };
+
     // Fetch playlist tracks (for RAG processing preparation)
     const fetchPlaylistTracks = async (playlistId, playlistName) => {
         setLoadingTracks(true);
         try {
             console.log(`Fetching tracks for playlist: ${playlistName}`);
             
-            // Fetch all tracks (handle pagination)
             let allTracks = [];
             let nextUrl = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=50`;
             
@@ -112,7 +240,6 @@ export default function Dashboard() {
             setLoading(true);
             setError(null);
 
-            // 1. Check if the user is authenticated
             const token = localStorage.getItem('spotifyAccessToken');
             console.log('Access Token:', token ? 'EXISTS' : 'NOT FOUND');
 
@@ -122,18 +249,16 @@ export default function Dashboard() {
                 return;
             }
 
-            // 2. Fetch user data with auto-refresh
             console.log('Fetching user data...');
             const userResponse = await makeSpotifyRequest('https://api.spotify.com/v1/me');
             console.log('User data fetched successfully:', userResponse.data.display_name);
             setUserData(userResponse.data);
 
-            // 3. Fetch user's playlists with pagination
             console.log('Fetching playlists...');
             let allPlaylists = [];
             let nextUrl = 'https://api.spotify.com/v1/me/playlists?limit=50';
             
-            while (nextUrl && allPlaylists.length < 200) { // Limit to 200 playlists
+            while (nextUrl && allPlaylists.length < 200) {
                 const playlistsResponse = await makeSpotifyRequest(nextUrl);
                 allPlaylists = [...allPlaylists, ...playlistsResponse.data.items];
                 nextUrl = playlistsResponse.data.next;
@@ -160,25 +285,22 @@ export default function Dashboard() {
         fetchData();
     }, [fetchData]);
 
-    // Prepare playlist for RAG processing
+    // REPLACE YOUR preparePlaylistForProcessing FUNCTION WITH THIS:
     const preparePlaylistForProcessing = async (playlist) => {
-        await fetchPlaylistTracks(playlist.id, playlist.name);
-        // Here you would typically send the tracks to your RAG processing endpoint
-        console.log('Playlist ready for RAG processing:', {
-            playlistId: playlist.id,
-            name: playlist.name,
-            trackCount: playlistTracks.length
-        });
+        await processPlaylistWithRAG(playlist);
     };
 
-    // Loading state
-    // In your Dashboard component, find this section (around line 140-170):
-
-// Loading state - REPLACE THIS ENTIRE SECTION
+    // Loading state (keep your existing loading component)
     if (loading) {
         return (
-            <div>
-                {/* Main Loading Container */}
+            <div style={{
+                display: 'flex',
+                justifyContent: 'center',
+                alignItems: 'center',
+                height: '100vh',
+                backgroundColor: '#1a1a1a',
+                color: 'white'
+            }}>
                 <div style={{
                     display: 'flex',
                     flexDirection: 'column',
@@ -190,7 +312,6 @@ export default function Dashboard() {
                     padding: '40px 60px',
                     boxShadow: '0 8px 32px rgba(0, 0, 0, 0.3)'
                 }}>
-                    {/* Spotify-style Loading Spinner */}
                     <div style={{
                         position: 'relative',
                         width: '60px',
@@ -213,101 +334,32 @@ export default function Dashboard() {
                             borderRadius: '50%',
                             animation: 'spin 1s linear infinite'
                         }}></div>
-                        
                     </div>
-
-                    {/* Loading Text */}
-                    <div style={{
-                        textAlign: 'center',
-                        marginBottom: '16px'
+                    <h2 style={{
+                        fontSize: '1.5rem',
+                        fontWeight: '600',
+                        margin: '0 0 8px 0',
+                        background: 'linear-gradient(45deg, #1db954, #1ed760)',
+                        backgroundClip: 'text',
+                        WebkitBackgroundClip: 'text',
+                        WebkitTextFillColor: 'transparent',
+                        animation: 'glow 2s ease-in-out infinite alternate'
                     }}>
-                        <h2 style={{
-                            fontSize: '1.5rem',
-                            fontWeight: '600',
-                            margin: '0 0 8px 0',
-                            background: 'linear-gradient(45deg, #1db954, #1ed760)',
-                            backgroundClip: 'text',
-                            WebkitBackgroundClip: 'text',
-                            WebkitTextFillColor: 'transparent',
-                            animation: 'glow 2s ease-in-out infinite alternate'
-                        }}>
-                            Loading your music
-                        </h2>
-                        <p style={{
-                            fontSize: '0.9rem',
-                            color: 'rgba(255, 255, 255, 0.7)',
-                            margin: '0',
-                            animation: 'fadeInOut 2s ease-in-out infinite'
-                        }}>
-                            Fetching your Spotify data...
-                        </p>
-                    </div>
-
-                    {/* Progress Dots */}
-                    <div style={{
-                        display: 'flex',
-                        gap: '8px',
-                        alignItems: 'center'
+                        Loading your music
+                    </h2>
+                    <p style={{
+                        fontSize: '0.9rem',
+                        color: 'rgba(255, 255, 255, 0.7)',
+                        margin: '0'
                     }}>
-                        {[0, 1, 2].map(i => (
-                            <div
-                                key={i}
-                                style={{
-                                    width: '8px',
-                                    height: '8px',
-                                    borderRadius: '50%',
-                                    background: '#1db954',
-                                    animation: `bounce 1.4s ease-in-out ${i * 0.16}s infinite both`
-                                }}
-                            ></div>
-                        ))}
-                    </div>
+                        Fetching your Spotify data...
+                    </p>
                 </div>
-
-                {/* Animations */}
-                <style jsx>{`
-                    @keyframes spin {
-                        0% { transform: rotate(0deg); }
-                        100% { transform: rotate(360deg); }
-                    }
-                    
-                    @keyframes pulse {
-                        0%, 100% { 
-                            transform: translate(-50%, -50%) scale(0.8);
-                            opacity: 0.8;
-                        }
-                        50% { 
-                            transform: translate(-50%, -50%) scale(1.1);
-                            opacity: 1;
-                        }
-                    }
-                    
-                    @keyframes glow {
-                        0% { filter: brightness(1) drop-shadow(0 0 5px rgba(29, 185, 84, 0.3)); }
-                        100% { filter: brightness(1.2) drop-shadow(0 0 15px rgba(29, 185, 84, 0.5)); }
-                    }
-                    
-                    @keyframes fadeInOut {
-                        0%, 100% { opacity: 0.7; }
-                        50% { opacity: 1; }
-                    }
-                    
-                    @keyframes bounce {
-                        0%, 80%, 100% { 
-                            transform: scale(0);
-                            opacity: 0.5;
-                        }
-                        40% { 
-                            transform: scale(1);
-                            opacity: 1;
-                        }
-                    }
-                `}</style>
             </div>
         );
     }
 
-    // Error state
+    // Error state (keep your existing error component)
     if (error) {
         return (
             <div style={{
@@ -367,6 +419,31 @@ export default function Dashboard() {
                 <h1 style={{ fontSize: '2rem', fontWeight: 'bold', marginBottom: '16px' }}>
                     Resonance Dashboard
                 </h1>
+                
+                {/* NEW: Weaviate Status Indicator */}
+                <div style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '12px',
+                    marginBottom: '16px'
+                }}>
+                    <div style={{
+                        padding: '4px 12px',
+                        borderRadius: '12px',
+                        fontSize: '0.75rem',
+                        fontWeight: 'bold',
+                        background: weaviateStatus === 'ready' ? '#28a745' : 
+                                   weaviateStatus === 'error' ? '#dc3545' : '#ffc107',
+                        color: weaviateStatus === 'initializing' ? '#000' : '#fff'
+                    }}>
+                        🤖 AI: {weaviateStatus === 'ready' ? 'READY' : 
+                               weaviateStatus === 'error' ? 'ERROR' : 'LOADING...'}
+                    </div>
+                    <div style={{ fontSize: '0.875rem', color: '#bbb' }}>
+                        {processedPlaylists.length} playlists processed
+                    </div>
+                </div>
+
                 {userData && (
                     <div style={{
                         background: '#333',
@@ -399,7 +476,155 @@ export default function Dashboard() {
                 )}
             </header>
 
-            {/* Playlist Section */}
+            {/* NEW: RAG Search Section - ADD THIS BEFORE PLAYLISTS */}
+            <section style={{ marginBottom: '32px' }}>
+                <h2 style={{ fontSize: '1.5rem', fontWeight: 'bold', marginBottom: '16px' }}>
+                    🎯 AI-Powered Music Search
+                </h2>
+                
+                {/* Search Bar */}
+                <div style={{ 
+                    display: 'flex', 
+                    gap: '8px', 
+                    marginBottom: '16px',
+                    alignItems: 'center'
+                }}>
+                    <input
+                        type="text"
+                        placeholder="Search for songs by mood, genre, energy, or description..."
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        onKeyPress={(e) => e.key === 'Enter' && searchSongs()}
+                        style={{
+                            flex: 1,
+                            padding: '12px',
+                            borderRadius: '8px',
+                            border: '1px solid #666',
+                            background: '#333',
+                            color: 'white',
+                            fontSize: '1rem'
+                        }}
+                    />
+                    <button
+                        onClick={searchSongs}
+                        disabled={searching || !searchQuery.trim()}
+                        style={{
+                            background: searching ? '#666' : '#1db954',
+                            color: 'white',
+                            border: 'none',
+                            padding: '12px 24px',
+                            borderRadius: '8px',
+                            cursor: searching ? 'not-allowed' : 'pointer',
+                            fontSize: '1rem',
+                            fontWeight: 'bold'
+                        }}
+                    >
+                        {searching ? 'Searching...' : '🔍 Search'}
+                    </button>
+                </div>
+                
+                {/* Quick Action Buttons */}
+                <div style={{ display: 'flex', gap: '8px', marginBottom: '16px', flexWrap: 'wrap' }}>
+                    {[
+                        { theme: 'energetic', mood: 'upbeat' },
+                        { theme: 'relaxing', mood: 'calm' },
+                        { theme: 'romantic', mood: 'love' },
+                        { theme: 'workout', mood: 'intense' },
+                        { theme: 'study', mood: 'focus' },
+                        { theme: 'party', mood: 'dance' }
+                    ].map(({ theme, mood }) => (
+                        <button
+                            key={`${theme}-${mood}`}
+                            onClick={() => generateSmartPlaylist(theme, mood)}
+                            disabled={weaviateStatus !== 'ready'}
+                            style={{
+                                background: '#444',
+                                color: 'white',
+                                border: '1px solid #666',
+                                padding: '8px 16px',
+                                borderRadius: '20px',
+                                cursor: weaviateStatus !== 'ready' ? 'not-allowed' : 'pointer',
+                                fontSize: '0.875rem',
+                                transition: 'all 0.2s',
+                                opacity: weaviateStatus !== 'ready' ? 0.5 : 1
+                            }}
+                            onMouseEnter={(e) => {
+                                if (weaviateStatus === 'ready') {
+                                    e.currentTarget.style.background = '#1db954';
+                                    e.currentTarget.style.transform = 'scale(1.05)';
+                                }
+                            }}
+                            onMouseLeave={(e) => {
+                                e.currentTarget.style.background = '#444';
+                                e.currentTarget.style.transform = 'scale(1)';
+                            }}
+                        >
+                            {theme} {mood}
+                        </button>
+                    ))}
+                </div>
+                
+                {/* Search Results */}
+                {searchResults.length > 0 && (
+                    <div style={{ 
+                        background: '#333', 
+                        borderRadius: '8px', 
+                        padding: '16px',
+                        maxHeight: '400px',
+                        overflowY: 'auto'
+                    }}>
+                        <h3 style={{ marginBottom: '12px', color: '#1db954' }}>
+                            🎵 Found {searchResults.length} songs
+                        </h3>
+                        {searchResults.map((song, index) => (
+                            <div key={index} style={{ 
+                                display: 'flex', 
+                                justifyContent: 'space-between',
+                                alignItems: 'center',
+                                padding: '12px',
+                                borderBottom: index < searchResults.length - 1 ? '1px solid #444' : 'none',
+                                borderRadius: '4px',
+                                transition: 'background 0.2s'
+                            }}
+                            onMouseEnter={(e) => e.currentTarget.style.background = '#404040'}
+                            onMouseLeave={(e) => e.currentTarget.style.background = 'transparent'}
+                            >
+                                <div>
+                                    <div style={{ fontWeight: 'bold', fontSize: '1rem' }}>
+                                        {song.title}
+                                    </div>
+                                    <div style={{ color: '#bbb', fontSize: '0.875rem' }}>
+                                        {song.artist} • {song.album}
+                                    </div>
+                                    {song.audioFeatures && (
+                                        <div style={{ color: '#888', fontSize: '0.75rem', marginTop: '4px' }}>
+                                            Energy: {(song.audioFeatures.energy * 100).toFixed(0)}% • 
+                                            Danceability: {(song.audioFeatures.danceability * 100).toFixed(0)}% • 
+                                            Valence: {(song.audioFeatures.valence * 100).toFixed(0)}%
+                                        </div>
+                                    )}
+                                </div>
+                                <button
+                                    onClick={() => window.open(`https://open.spotify.com/track/${song.spotifyId}`, '_blank')}
+                                    style={{
+                                        background: '#1db954',
+                                        color: 'white',
+                                        border: 'none',
+                                        padding: '6px 12px',
+                                        borderRadius: '4px',
+                                        cursor: 'pointer',
+                                        fontSize: '0.75rem'
+                                    }}
+                                >
+                                    🎵 Play
+                                </button>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </section>
+
+            {/* Playlist Section - KEEP YOUR EXISTING CODE BUT UPDATE THE BUTTON */}
             <section>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
                     <h2 style={{ fontSize: '1.5rem', fontWeight: 'bold' }}>
@@ -470,26 +695,30 @@ export default function Dashboard() {
                                     {playlist.tracks.total} tracks • By {playlist.owner.display_name}
                                 </p>
                                 
-                                {/* Action Buttons */}
+                                {/* UPDATED Action Buttons */}
                                 <div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}>
                                     <button
                                         onClick={(e) => {
                                             e.stopPropagation();
-                                            preparePlaylistForProcessing(playlist);
+                                            processPlaylistWithRAG(playlist);
                                         }}
-                                        disabled={loadingTracks && selectedPlaylist?.id === playlist.id}
+                                        disabled={processing || weaviateStatus !== 'ready'}
                                         style={{
-                                            background: '#1db954',
+                                            background: processing ? '#666' : 
+                                                      processedPlaylists.includes(playlist.id) ? '#28a745' : 
+                                                      weaviateStatus !== 'ready' ? '#666' : '#1db954',
                                             color: 'white',
                                             border: 'none',
                                             padding: '6px 12px',
                                             borderRadius: '4px',
-                                            cursor: loadingTracks && selectedPlaylist?.id === playlist.id ? 'not-allowed' : 'pointer',
+                                            cursor: (processing || weaviateStatus !== 'ready') ? 'not-allowed' : 'pointer',
                                             fontSize: '0.75rem',
-                                            opacity: loadingTracks && selectedPlaylist?.id === playlist.id ? 0.5 : 1
+                                            opacity: (processing || weaviateStatus !== 'ready') ? 0.5 : 1
                                         }}
                                     >
-                                        {loadingTracks && selectedPlaylist?.id === playlist.id ? 'Loading...' : '🎯 Analyze & Sort'}
+                                        {processing ? '⏳ Processing...' : 
+                                         processedPlaylists.includes(playlist.id) ? '✅ AI Processed' : 
+                                         weaviateStatus !== 'ready' ? '⏳ AI Loading...' : '🤖 Process with AI'}
                                     </button>
                                     
                                     <button
@@ -518,7 +747,7 @@ export default function Dashboard() {
                 )}
             </section>
 
-            {/* Selected Playlist Details */}
+            {/* Keep your existing Selected Playlist Details section */}
             {selectedPlaylist && playlistTracks.length > 0 && (
                 <section style={{ marginTop: '32px' }}>
                     <h3 style={{ fontSize: '1.25rem', fontWeight: 'bold', marginBottom: '16px' }}>
@@ -597,7 +826,42 @@ export default function Dashboard() {
                 >
                     🔄 Refresh Data
                 </button>
+                
+                {/* NEW: Debug/Status Button */}
+                <button 
+                    onClick={async () => {
+                        try {
+                            const health = await axios.get('http://127.0.0.1:8000/api/weaviate/health');
+                            alert(`Weaviate Status: ${JSON.stringify(health.data, null, 2)}`);
+                        } catch (error) {
+                            alert(`Weaviate Error: ${error.message}`);
+                        }
+                    }}
+                    style={{
+                        background: '#17a2b8',
+                        color: 'white',
+                        border: 'none',
+                        padding: '10px 20px',
+                        borderRadius: '5px',
+                        cursor: 'pointer'
+                    }}
+                >
+                    🔍 Check AI Status
+                </button>
             </div>
+            
+            {/* Add CSS animations */}
+            <style jsx>{`
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+                
+                @keyframes glow {
+                    0% { filter: brightness(1) drop-shadow(0 0 5px rgba(29, 185, 84, 0.3)); }
+                    100% { filter: brightness(1.2) drop-shadow(0 0 15px rgba(29, 185, 84, 0.5)); }
+                }
+            `}</style>
         </div>
     );
 }
